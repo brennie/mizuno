@@ -1,46 +1,38 @@
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::str;
 
 use byteorder::{BigEndian, ReadBytesExt};
-use failure::Error;
-use lazy_static::lazy_static;
+use failure::{err_msg, Error, ResultExt};
 
-#[derive(Clone, Debug, Default)]
-pub struct ConnectionBuilder<'a> {
-    path: Option<&'a Path>,
+include!(concat!(env!("OUT_DIR"), "/capabilities.codegen.rs"));
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum Capability {
+    RunCommand,
+    GetEncoding,
+    Unknown(String),
 }
 
-impl<'a> ConnectionBuilder<'a> {
-    pub fn new() -> Self {
-        Default::default()
-    }
-
-    pub fn with_path(&'a mut self, path: &'a Path) -> &'a mut Self {
-        self.path = Some(path);
-        self
-    }
-
-    pub fn connect(&self) -> Result<Connection, Error> {
-        lazy_static! {
-            static ref HG: &'static Path = Path::new("hg");
-        }
-
-        let hg = Command::new(self.path.unwrap_or(*HG))
-            .arg("serve")
-            .arg("--cmdserver")
-            .arg("pipe")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()?;
-
-        Ok(Connection { hg })
+impl<S> From<S> for Capability
+where
+    S: AsRef<str> + Into<String>,
+{
+    fn from(s: S) -> Self {
+        CAPABILITIES
+            .get(s.as_ref())
+            .cloned()
+            .unwrap_or_else(|| Capability::Unknown(s.into()))
     }
 }
 
 #[derive(Debug)]
 pub struct Connection {
     hg: Child,
+    encoding: String,
+    capabilities: HashSet<Capability>,
 }
 
 impl Drop for Connection {
@@ -51,25 +43,88 @@ impl Drop for Connection {
 
 impl Connection {
     pub fn new() -> Result<Connection, Error> {
-        ConnectionBuilder::new().connect()
+        let mut hg = Self::start_hg(Path::new("hg"))?;
+
+        let chunk = {
+            let stdout = hg.stdout.as_mut().expect("no stdout handle");
+            Self::read_chunk_from(stdout).context("Could not read hello")?
+        };
+
+        let Chunk::Output(bytes) = chunk;
+        let s = str::from_utf8(&bytes)?;
+
+        let mut encoding = None;
+        let mut capabilities: Option<HashSet<Capability>> = None;
+
+        for line in s.lines() {
+            let split_at = line
+                .find(": ")
+                .ok_or_else(|| err_msg("no field: value in hello"))?;
+            let (key, value) = line.split_at(split_at);
+            let value = &value[2..];
+
+            match dbg!(key) {
+                "capabilities" => {
+                    capabilities = Some(value.split(" ").map(Into::into).collect());
+                }
+                "encoding" => encoding = Some(value.into()),
+                _ => {
+                    // Ignore unknown fields in hello.
+                }
+            }
+        }
+
+        let encoding = encoding.ok_or_else(|| err_msg("no encoding in hello"))?;
+        let capabilities = capabilities.ok_or_else(|| err_msg("no capabilities in hello"))?;
+
+        if !capabilities.contains(&Capability::RunCommand) {
+            Err(err_msg("No runcommand capability"))
+        } else {
+            Ok(Connection {
+                hg,
+                encoding,
+                capabilities,
+            })
+        }
     }
 
-    pub fn read_chunk(&mut self) -> Result<Chunk, Error> {
-        let stdout = self.hg.stdout.as_mut().expect("no stdout handle?");
+    pub fn capabilities(&self) -> &HashSet<Capability> {
+        &self.capabilities
+    }
 
+    pub fn encoding(&self) -> &str {
+        &self.encoding
+    }
+
+    fn start_hg(hg: &Path) -> Result<Child, Error> {
+        Command::new(hg)
+            .arg("serve")
+            .arg("--cmdserver")
+            .arg("pipe")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .context("Could not launch hg")
+            .map_err(Into::into)
+    }
+
+    fn read_chunk_from<R>(r: &mut R) -> Result<Chunk, Error>
+    where
+        R: Read,
+    {
         let channel = {
             let mut buf = [0u8];
-            stdout.read_exact(&mut buf)?;
+            r.read_exact(&mut buf)?;
 
             buf[0]
         };
 
         let chunk = match channel {
             b'o' => {
-                let len = stdout.read_u32::<BigEndian>()? as usize;
+                let len = r.read_u32::<BigEndian>()? as usize;
                 let mut buf = vec![0; len];
 
-                stdout.read_exact(&mut buf)?;
+                r.read_exact(&mut buf)?;
 
                 Chunk::Output(buf)
             }
@@ -85,6 +140,10 @@ impl Connection {
 
         Ok(chunk)
     }
+
+    pub fn read_chunk(&mut self) -> Result<Chunk, Error> {
+        Self::read_chunk_from(self.hg.stdout.as_mut().expect("no stdout handle"))
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -94,20 +153,13 @@ pub enum Chunk {
 
 #[cfg(test)]
 mod test {
-    use crate::{Chunk, Connection};
-    use std::str;
+    use crate::{Capability, Connection};
 
     #[test]
-    fn read_chunk() -> Result<(), failure::Error> {
-        let mut conn = Connection::new()?;
-        let chunk = conn.read_chunk()?;
-
-        let Chunk::Output(bytes) = chunk;
-        let hello = str::from_utf8(&bytes)?.split('\n').collect::<Vec<_>>();
-
-        assert!(hello.len() > 2);
-        assert_eq!(hello[0], "capabilities: getencoding runcommand");
-        assert_eq!(hello[1], "encoding: UTF-8");
+    fn hello() -> Result<(), failure::Error> {
+        let conn = Connection::new()?;
+        assert_eq!(conn.encoding(), "UTF-8");
+        assert!(conn.capabilities().contains(&Capability::RunCommand));
 
         Ok(())
     }
