@@ -13,3 +13,6 @@ phf = "0.7.24"
 [build-dependencies]
 failure = "0.1.5"
 phf_codegen = "0.7.24"
+
+[dev-dependencies]
+tempdir = "0.3.7"
