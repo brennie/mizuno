@@ -63,7 +63,7 @@ impl Connection {
             let (key, value) = line.split_at(split_at);
             let value = &value[2..];
 
-            match dbg!(key) {
+            match key {
                 "capabilities" => {
                     capabilities = Some(value.split(" ").map(Into::into).collect());
                 }
