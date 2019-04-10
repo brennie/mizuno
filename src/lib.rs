@@ -110,14 +110,13 @@ impl Connection {
             let mut stdin = self.hg.stdin.as_mut().expect("no stdin handle");
 
             write!(&mut stdin, "runcommand\n")?;
+
             stdin.write_u32::<BigEndian>(len as u32)?;
-            eprintln!("wrote len = {}", len);
+
             for (i, part) in command.iter().enumerate() {
                 write!(&mut stdin, "{}", part)?;
-                eprintln!("wrote {}", part);
                 if i + 1 != command.len() {
                     write!(&mut stdin, "{}", 0 as char)?;
-                    eprintln!("wrote 0");
                 }
             }
         }
