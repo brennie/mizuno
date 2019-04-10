@@ -64,7 +64,7 @@ pub enum Chunk {
     Output(Vec<u8>),
     Error(Vec<u8>),
     Debug(Vec<u8>),
-    Result(u32),
+    Result(Vec<u8>),
     Input(u32),
     LineInput(u32),
 }
@@ -184,7 +184,7 @@ impl Connection {
         };
 
         Ok(match channel {
-            Channel::Output | Channel::Error | Channel::Debug => {
+            Channel::Output | Channel::Error | Channel::Debug | Channel::Result => {
                 let len = r.read_u32::<BigEndian>()? as usize;
                 let mut buf = vec![0; len];
 
@@ -194,15 +194,15 @@ impl Connection {
                     Channel::Output => Chunk::Output(buf),
                     Channel::Error => Chunk::Error(buf),
                     Channel::Debug => Chunk::Debug(buf),
+                    Channel::Result => Chunk::Result(buf),
                     _ => unreachable!(),
                 }
             }
 
-            Channel::Result | Channel::Input | Channel::LineInput => {
+            Channel::Input | Channel::LineInput => {
                 let val = r.read_u32::<BigEndian>()?;
 
                 match channel {
-                    Channel::Result => Chunk::Result(val),
                     Channel::Input => Chunk::Input(val),
                     Channel::LineInput => Chunk::LineInput(val),
                     _ => unreachable!(),
@@ -310,7 +310,7 @@ mod test {
         let mut conn = Connection::new()?;
 
         let chunk = conn.run_command(&["init"])?.collect::<Result<Vec<_>, _>>()?;
-        assert_eq!(chunk, vec![Chunk::Result(4)]);
+        assert_eq!(chunk, vec![Chunk::Result(vec![0, 0, 0, 0])]);
 
         Ok(())
     }
@@ -336,7 +336,7 @@ mod test {
         .bytes()
         .collect::<Vec<_>>();
 
-        assert_eq!(chunks, &[Chunk::Error(err_msg), Chunk::Result(4),]);
+        assert_eq!(chunks, &[Chunk::Error(err_msg), Chunk::Result(vec![0, 0, 0, 255]),]);
 
         Ok(())
     }
