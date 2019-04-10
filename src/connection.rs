@@ -36,7 +36,7 @@ impl ConnectionBuilder {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Channel {
+pub enum Channel {
     Output,
     Error,
     Debug,
@@ -67,6 +67,19 @@ pub enum Chunk {
     Result(u32),
     Input(u32),
     LineInput(u32),
+}
+
+impl Chunk {
+    pub fn channel(&self) -> Channel {
+        match self {
+            Chunk::Output(..) => Channel::Output,
+            Chunk::Error(..) => Channel::Error,
+            Chunk::Debug(..) => Channel::Debug,
+            Chunk::Result(..) => Channel::Result,
+            Chunk::Input(..) => Channel::Input,
+            Chunk::LineInput(..) => Channel::LineInput,
+        }
+    }
 }
 
 #[derive(Debug)]
