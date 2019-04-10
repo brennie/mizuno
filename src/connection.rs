@@ -148,11 +148,15 @@ impl Connection {
         Self::read_chunk_from(self.hg.stdout.as_mut().expect("no stdout handle"))
     }
 
-    pub fn run_command(&mut self, command: &[&str]) -> Result<Chunk, Error> {
+    pub fn run_command(
+        &'_ mut self,
+        command: &[&str],
+    ) -> Result<CommandIterator<'_>, Error> {
         let len: usize = command.iter().map(|s| s.len()).sum::<usize>() + command.len() - 1;
 
         let mut stdin = self.hg.stdin.as_mut().expect("no stdin handle");
 
+        // TODO: Any communication errors should bring down the connection.
         write!(&mut stdin, "runcommand\n")?;
 
         stdin.write_u32::<BigEndian>(len as u32)?;
@@ -165,7 +169,7 @@ impl Connection {
             }
         }
 
-        self.read_chunk()
+        Ok(CommandIterator::new(self))
     }
 
     fn read_chunk_from<R>(r: &mut R) -> Result<Chunk, Error>
@@ -245,13 +249,49 @@ impl Connection {
     }
 }
 
+pub struct CommandIterator<'a> {
+    conn: &'a mut Connection,
+    finished: bool,
+}
+
+impl<'a> CommandIterator<'a> {
+    pub(self) fn new(conn: &'a mut Connection) -> Self {
+        CommandIterator {
+            conn,
+            finished: false,
+        }
+    }
+}
+
+impl<'a> Iterator for CommandIterator<'a> {
+    type Item = Result<Chunk, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+
+        let chunk = match self.conn.read_chunk() {
+            Ok(chunk) => chunk,
+            err @ Err(..) => return Some(err),
+        };
+
+        if chunk.channel() == Channel::Result {
+            self.finished = true;
+        }
+
+        Some(Ok(chunk))
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::env::set_current_dir;
+    use std::path::Path;
 
     use tempdir::TempDir;
 
-    use super::{Capability, Chunk, Connection};
+    use super::{Capability, Chunk, Connection, ConnectionBuilder};
 
     #[test]
     fn hello() -> Result<(), failure::Error> {
@@ -263,15 +303,40 @@ mod test {
     }
 
     #[test]
-    fn runcommand_status() -> Result<(), failure::Error> {
+    fn runcommand_init() -> Result<(), failure::Error> {
         let tmpdir = TempDir::new("hg-repo")?;
         set_current_dir(&tmpdir)?;
 
         let mut conn = Connection::new()?;
 
-        let chunk = conn.run_command(&["init"])?;
+        let chunk = conn.run_command(&["init"])?.collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(chunk, vec![Chunk::Result(4)]);
 
-        assert_eq!(chunk, Chunk::Result(4));
+        Ok(())
+    }
+
+    #[test]
+    fn runcommand_status() -> Result<(), failure::Error> {
+        let path = if cfg!(windows) {
+            Path::new("C:\\")
+        } else {
+            Path::new("/")
+        };
+
+        let mut conn = ConnectionBuilder::new().with_pwd(&path).connect()?;
+
+        let chunks = conn
+            .run_command(&["status"])?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let err_msg = format!(
+            "abort: no repository found in '{}' (.hg not found)!\n",
+            path.display()
+        )
+        .bytes()
+        .collect::<Vec<_>>();
+
+        assert_eq!(chunks, &[Chunk::Error(err_msg), Chunk::Result(4),]);
 
         Ok(())
     }
