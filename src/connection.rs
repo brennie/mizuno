@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::str;
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
@@ -85,6 +85,8 @@ impl Chunk {
 #[derive(Debug)]
 pub struct Connection {
     hg: Child,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
     encoding: String,
     capabilities: HashSet<Capability>,
 }
@@ -125,12 +127,19 @@ impl Connection {
 
         let mut hg = command.spawn()?;
 
-        let hello_chunk = Self::read_chunk_from(hg.stdout.as_mut().expect("no stdout handle"))?;
+        let stdin = hg.stdin.take().ok_or_else(|| err_msg("no stdin handle"))?;
+        let mut stdout = hg
+            .stdout
+            .take()
+            .ok_or_else(|| err_msg("no stdout handle"))?;
 
+        let hello_chunk = Self::read_chunk_from(&mut stdout)?;
         let (encoding, capabilities) = Self::parse_hello(hello_chunk)?;
 
         Ok(Connection {
             hg,
+            stdin,
+            stdout,
             encoding,
             capabilities,
         })
@@ -145,24 +154,22 @@ impl Connection {
     }
 
     pub fn read_chunk(&mut self) -> Result<Chunk, Error> {
-        Self::read_chunk_from(self.hg.stdout.as_mut().expect("no stdout handle"))
+        Self::read_chunk_from(&mut self.stdout)
     }
 
     pub fn run_command(&'_ mut self, command: &[&str]) -> Result<CommandIterator<'_>, Error> {
         let len: usize = command.iter().map(|s| s.len()).sum::<usize>() + command.len() - 1;
 
-        let mut stdin = self.hg.stdin.as_mut().expect("no stdin handle");
-
         // TODO: Any communication errors should bring down the connection.
-        write!(&mut stdin, "runcommand\n")?;
+        write!(&mut self.stdin, "runcommand\n")?;
 
-        stdin.write_u32::<BigEndian>(len as u32)?;
+        self.stdin.write_u32::<BigEndian>(len as u32)?;
 
         for (i, part) in command.iter().enumerate() {
-            write!(&mut stdin, "{}", part)?;
+            write!(&mut self.stdin, "{}", part)?;
 
             if i + 1 != command.len() {
-                write!(&mut stdin, "{}", 0 as char)?;
+                write!(&mut self.stdin, "{}", 0 as char)?;
             }
         }
 
