@@ -148,10 +148,7 @@ impl Connection {
         Self::read_chunk_from(self.hg.stdout.as_mut().expect("no stdout handle"))
     }
 
-    pub fn run_command(
-        &'_ mut self,
-        command: &[&str],
-    ) -> Result<CommandIterator<'_>, Error> {
+    pub fn run_command(&'_ mut self, command: &[&str]) -> Result<CommandIterator<'_>, Error> {
         let len: usize = command.iter().map(|s| s.len()).sum::<usize>() + command.len() - 1;
 
         let mut stdin = self.hg.stdin.as_mut().expect("no stdin handle");
@@ -309,7 +306,10 @@ mod test {
 
         let mut conn = Connection::new()?;
 
-        let chunk = conn.run_command(&["init"])?.collect::<Result<Vec<_>, _>>()?;
+        let chunk = conn
+            .run_command(&["init"])?
+            .collect::<Result<Vec<_>, _>>()?;
+
         assert_eq!(chunk, vec![Chunk::Result(vec![0, 0, 0, 0])]);
 
         Ok(())
@@ -336,7 +336,10 @@ mod test {
         .bytes()
         .collect::<Vec<_>>();
 
-        assert_eq!(chunks, &[Chunk::Error(err_msg), Chunk::Result(vec![0, 0, 0, 255]),]);
+        assert_eq!(
+            chunks,
+            &[Chunk::Error(err_msg), Chunk::Result(vec![0, 0, 0, 255])]
+        );
 
         Ok(())
     }
