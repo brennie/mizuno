@@ -1,13 +1,68 @@
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::fmt;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::str;
+use std::str::{self, Utf8Error};
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use failure::{err_msg, format_err, Error};
+use failure::Fail;
 
 use crate::capabilities::Capability;
+
+#[derive(Debug, Fail)]
+pub enum ConnectionError {
+    #[fail(display = "IO error: {}", _0)]
+    Io(#[cause] io::Error),
+
+    #[fail(display = "No stdin handle")]
+    NoStdin,
+
+    #[fail(display = "No stdout handle")]
+    NoStdout,
+
+    #[fail(display = "Error parsing hello: {}", _0)]
+    Hello(HelloError),
+}
+
+#[derive(Debug, Fail)]
+pub enum HelloError {
+    #[fail(display = "Failed to read hello chunk: {}", _0)]
+    ReadChunk(#[cause] ReadChunkError),
+
+    #[fail(
+        display = "hello from Mercurial on invalid channel; got {} but expected output",
+        _0
+    )]
+    InvalidChannel(Channel),
+
+    #[fail(display = "Could not decode hello from Mercurial: {}", _0)]
+    DecodeError(#[cause] Utf8Error),
+
+    #[fail(display = "hello from Mercurial missing encoding")]
+    NoEncoding,
+
+    #[fail(display = "hello from Mercurial missing capabilities")]
+    NoCapabilities,
+
+    #[fail(display = "Mercurial lacks runcommand capability")]
+    MissingRunCommand,
+}
+
+#[derive(Debug, Fail)]
+pub enum ReadChunkError {
+    #[fail(display = "Could not read channel: {}", _0)]
+    ReadChannel(#[cause] io::Error),
+
+    #[fail(display = "Could not read chunk length: {}", _0)]
+    ReadLength(#[cause] io::Error),
+
+    #[fail(display = "Could not read chunk data: {}", _0)]
+    ReadData(#[cause] io::Error),
+
+    #[fail(display = "{}", _0)]
+    InvalidChannel(InvalidChannelError),
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct ConnectionBuilder {
@@ -30,9 +85,15 @@ impl ConnectionBuilder {
         self
     }
 
-    pub fn connect(&self) -> Result<Connection, failure::Error> {
+    pub fn connect(&self) -> Result<Connection, ConnectionError> {
         Connection::from_builder(&self)
     }
+}
+
+#[derive(Debug, Fail)]
+#[fail(display = "Unknown channel \"{}\"", channel)]
+pub struct InvalidChannelError {
+    pub channel: char,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,7 +107,7 @@ pub enum Channel {
 }
 
 impl Channel {
-    fn try_from(c: u8) -> Result<Self, Error> {
+    fn try_from(c: u8) -> Result<Self, InvalidChannelError> {
         Ok(match c {
             b'o' => Channel::Output,
             b'e' => Channel::Error,
@@ -54,8 +115,25 @@ impl Channel {
             b'r' => Channel::Result,
             b'I' => Channel::Input,
             b'L' => Channel::LineInput,
-            _ => return Err(format_err!("Unknown channel: {}", c)),
+            _ => return Err(InvalidChannelError { channel: c as char }),
         })
+    }
+}
+
+impl fmt::Display for Channel {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Channel::Output => "output",
+                Channel::Error => "error",
+                Channel::Debug => "debug",
+                Channel::Result => "result",
+                Channel::Input => "input",
+                Channel::LineInput => "line input",
+            }
+        )
     }
 }
 
@@ -98,11 +176,11 @@ impl Drop for Connection {
 }
 
 impl Connection {
-    pub fn new() -> Result<Self, failure::Error> {
+    pub fn new() -> Result<Self, ConnectionError> {
         Self::from_builder(&Default::default())
     }
 
-    pub(self) fn from_builder(builder: &ConnectionBuilder) -> Result<Self, Error> {
+    pub(self) fn from_builder(builder: &ConnectionBuilder) -> Result<Self, ConnectionError> {
         let hg_cmd = builder
             .hg
             .as_ref()
@@ -125,16 +203,16 @@ impl Connection {
             command.current_dir(pwd);
         }
 
-        let mut hg = command.spawn()?;
+        let mut hg = command.spawn().map_err(ConnectionError::Io)?;
 
-        let stdin = hg.stdin.take().ok_or_else(|| err_msg("no stdin handle"))?;
-        let mut stdout = hg
-            .stdout
-            .take()
-            .ok_or_else(|| err_msg("no stdout handle"))?;
+        let stdin = hg.stdin.take().ok_or(ConnectionError::NoStdin)?;
+        let mut stdout = hg.stdout.take().ok_or(ConnectionError::NoStdout)?;
 
-        let hello_chunk = Self::read_chunk_from(&mut stdout)?;
-        let (encoding, capabilities) = Self::parse_hello(hello_chunk)?;
+        let hello_chunk = Self::read_chunk_from(&mut stdout)
+            .map_err(|e| ConnectionError::Hello(HelloError::ReadChunk(e)))?;
+
+        let (encoding, capabilities) =
+            Self::parse_hello(hello_chunk).map_err(ConnectionError::Hello)?;
 
         Ok(Connection {
             hg,
@@ -153,11 +231,11 @@ impl Connection {
         &self.encoding
     }
 
-    pub fn read_chunk(&mut self) -> Result<Chunk, Error> {
+    pub fn read_chunk(&mut self) -> Result<Chunk, ReadChunkError> {
         Self::read_chunk_from(&mut self.stdout)
     }
 
-    pub fn run_command(&'_ mut self, command: &[&str]) -> Result<CommandIterator<'_>, Error> {
+    pub fn run_command(&'_ mut self, command: &[&str]) -> Result<CommandIterator<'_>, io::Error> {
         let len: usize = command.iter().map(|s| s.len()).sum::<usize>() + command.len() - 1;
 
         // TODO: Any communication errors should bring down the connection.
@@ -176,23 +254,26 @@ impl Connection {
         Ok(CommandIterator::new(self))
     }
 
-    fn read_chunk_from<R>(r: &mut R) -> Result<Chunk, Error>
+    fn read_chunk_from<R>(r: &mut R) -> Result<Chunk, ReadChunkError>
     where
         R: Read,
     {
         let channel = {
             let mut buf = [0u8];
-            r.read_exact(&mut buf)?;
+            r.read_exact(&mut buf)
+                .map_err(ReadChunkError::ReadChannel)?;
 
-            Channel::try_from(buf[0]).unwrap()
+            Channel::try_from(buf[0]).map_err(ReadChunkError::InvalidChannel)?
         };
 
         Ok(match channel {
             Channel::Output | Channel::Error | Channel::Debug | Channel::Result => {
-                let len = r.read_u32::<BigEndian>()? as usize;
+                let len = r
+                    .read_u32::<BigEndian>()
+                    .map_err(ReadChunkError::ReadLength)? as usize;
                 let mut buf = vec![0; len];
 
-                r.read_exact(&mut buf)?;
+                r.read_exact(&mut buf).map_err(ReadChunkError::ReadData)?;
 
                 match channel {
                     Channel::Output => Chunk::Output(buf),
@@ -204,7 +285,9 @@ impl Connection {
             }
 
             Channel::Input | Channel::LineInput => {
-                let val = r.read_u32::<BigEndian>()?;
+                let val = r
+                    .read_u32::<BigEndian>()
+                    .map_err(ReadChunkError::ReadData)?;
 
                 match channel {
                     Channel::Input => Chunk::Input(val),
@@ -215,16 +298,16 @@ impl Connection {
         })
     }
 
-    fn parse_hello(chunk: Chunk) -> Result<(String, HashSet<Capability>), Error> {
+    fn parse_hello(chunk: Chunk) -> Result<(String, HashSet<Capability>), HelloError> {
         let mut encoding = None;
         let mut capabilities = None;
 
         let hello_bytes = match chunk {
             Chunk::Output(bytes) => bytes,
-            _ => return Err(err_msg("invalid chunk kind in hello")),
+            _ => return Err(HelloError::InvalidChannel(chunk.channel())),
         };
 
-        let hello = str::from_utf8(&hello_bytes)?;
+        let hello = str::from_utf8(&hello_bytes).map_err(HelloError::DecodeError)?;
 
         for line in hello.lines() {
             if let Some(split_at) = line.find(": ") {
@@ -242,11 +325,11 @@ impl Connection {
             }
         }
 
-        let encoding = encoding.ok_or_else(|| err_msg("no encoding in hello"))?;
-        let capabilities = capabilities.ok_or_else(|| err_msg("no capabilities in hello"))?;
+        let encoding = encoding.ok_or(HelloError::NoEncoding)?;
+        let capabilities = capabilities.ok_or(HelloError::NoCapabilities)?;
 
         if !capabilities.contains(&Capability::RunCommand) {
-            Err(err_msg("no runcommand capability"))
+            Err(HelloError::MissingRunCommand)
         } else {
             Ok((encoding, capabilities))
         }
@@ -268,7 +351,7 @@ impl<'a> CommandIterator<'a> {
 }
 
 impl<'a> Iterator for CommandIterator<'a> {
-    type Item = Result<Chunk, Error>;
+    type Item = Result<Chunk, ReadChunkError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.finished {
