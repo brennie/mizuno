@@ -2,11 +2,15 @@ use std::collections::HashSet;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::str::{self, Utf8Error};
 
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{ByteOrder, BigEndian};
 use failure::Fail;
+use tokio::codec::{LengthDelimitedCodec, FramedRead};
+use tokio::io::read_exact;
+use tokio::prelude::*;
+use tokio_process::{Child, ChildStdin, ChildStdout, CommandExt};
 
 use crate::capabilities::Capability;
 
@@ -85,7 +89,7 @@ impl ConnectionBuilder {
         self
     }
 
-    pub fn connect(&self) -> Result<Connection, ConnectionError> {
+    pub fn connect(&self) -> impl Future<Item = Connection, Error = ConnectionError> {
         Connection::from_builder(&self)
     }
 }
@@ -163,8 +167,8 @@ impl Chunk {
 #[derive(Debug)]
 pub struct Connection {
     hg: Child,
-    stdin: ChildStdin,
-    stdout: ChildStdout,
+    stdin: Option<ChildStdin>,
+    stdout: Option<ChildStdout>,
     encoding: String,
     capabilities: HashSet<Capability>,
 }
@@ -176,11 +180,11 @@ impl Drop for Connection {
 }
 
 impl Connection {
-    pub fn new() -> Result<Self, ConnectionError> {
+    pub fn new() -> impl Future<Item = Self, Error = ConnectionError> {
         Self::from_builder(&Default::default())
     }
 
-    pub(self) fn from_builder(builder: &ConnectionBuilder) -> Result<Self, ConnectionError> {
+    pub(self) fn from_builder(builder: &ConnectionBuilder) -> impl Future<Item = Self, Error = ConnectionError> {
         let hg_cmd = builder
             .hg
             .as_ref()
@@ -203,24 +207,30 @@ impl Connection {
             command.current_dir(pwd);
         }
 
-        let mut hg = command.spawn().map_err(ConnectionError::Io)?;
+        let mut hg = match command.spawn_async() {
+            Ok(hg) => hg,
+            err @ Err(..) => return err.map_err(ConnectionError::Io).into_future(),
+        };
 
-        let stdin = hg.stdin.take().ok_or(ConnectionError::NoStdin)?;
-        let mut stdout = hg.stdout.take().ok_or(ConnectionError::NoStdout)?;
+        let stdin = hg.stdin().take().ok_or(ConnectionError::NoStdin)?;
+        let mut stdout = hg.stdout().take().ok_or(ConnectionError::NoStdout)?;
 
-        let hello_chunk = Self::read_chunk_from(&mut stdout)
-            .map_err(|e| ConnectionError::Hello(HelloError::ReadChunk(e)))?;
+        Self::read_chunk_from(&mut stdout)
+            .map_err(|e| ConnectionError::Hello(HelloError::ReadChunk(e)))
+            .map(move |(stdout, hello_chunk)| {
+                let (encoding, capabilities) = match Self::parse_hello(hello_chunk) {
+                    Ok(ok) => ok,
+                    err @ Err(..) => return err.map_err(ConnectionError::Hello).into_future();
+                }
 
-        let (encoding, capabilities) =
-            Self::parse_hello(hello_chunk).map_err(ConnectionError::Hello)?;
-
-        Ok(Connection {
-            hg,
-            stdin,
-            stdout,
-            encoding,
-            capabilities,
-        })
+                futures::ok(Connection {
+                    hg,
+                    stdin: Some(stdin),
+                    stdout: Some(stdout),
+                    encoding,
+                    capabilities,
+                })
+            })
     }
 
     pub fn capabilities(&self) -> &HashSet<Capability> {
@@ -231,7 +241,7 @@ impl Connection {
         &self.encoding
     }
 
-    pub fn read_chunk(&mut self) -> Result<Chunk, ReadChunkError> {
+    pub fn read_chunk(&mut self) -> impl Future<Item = (ChildStdout, Chunk), Error = ReadChunkError> {
         Self::read_chunk_from(&mut self.stdout)
     }
 
@@ -254,48 +264,60 @@ impl Connection {
         Ok(CommandIterator::new(self))
     }
 
-    fn read_chunk_from<R>(r: &mut R) -> Result<Chunk, ReadChunkError>
+    fn read_chunk_from<R>(r: &mut R) -> impl Future<Item = (R, Chunk), Error = ReadChunkError>
     where
-        R: Read,
+        R: AsyncRead,
     {
-        let channel = {
-            let mut buf = [0u8];
-            r.read_exact(&mut buf)
-                .map_err(ReadChunkError::ReadChannel)?;
+        read_exact(r, [0u8])
+            .map_err(ReadChunkError::ReadChannel)
+            .and_then(|(r, buf)| {
+                Channel::try_from(buf[0])
+                    .map_err(ReadChunkError::InvalidChannel)
+                    .map(move |c| (r, c))
+                    .into_future()
+            })
+            .and_then(|(r, channel)| match channel {
+                Channel::Output | Channel::Error | Channel::Debug | Channel::Result => {
+                    future::Either::A(
+                    read_exact(r, [0u8; 4])
+                        .map_err(ReadChunkError::ReadLength)
+                        .and_then(|(r, bytes)| {
+                            let len = BigEndian::read_u32(&bytes) as usize;
+                            let buf = vec![0; len];
 
-            Channel::try_from(buf[0]).map_err(ReadChunkError::InvalidChannel)?
-        };
+                            read_exact(r, buf)
+                                .map_err(ReadChunkError::ReadData)
+                        })
+                        .map(|(r, buf)| {
+                            let chunk = match channel {
+                                Channel::Output => Chunk::Output(buf),
+                                Channel::Error => Chunk::Error(buf),
+                                Channel::Debug => Chunk::Debug(buf),
+                                Channel::Result => Chunk::Result(buf),
+                                _ => unreachable!(),
+                            };
 
-        Ok(match channel {
-            Channel::Output | Channel::Error | Channel::Debug | Channel::Result => {
-                let len = r
-                    .read_u32::<BigEndian>()
-                    .map_err(ReadChunkError::ReadLength)? as usize;
-                let mut buf = vec![0; len];
-
-                r.read_exact(&mut buf).map_err(ReadChunkError::ReadData)?;
-
-                match channel {
-                    Channel::Output => Chunk::Output(buf),
-                    Channel::Error => Chunk::Error(buf),
-                    Channel::Debug => Chunk::Debug(buf),
-                    Channel::Result => Chunk::Result(buf),
-                    _ => unreachable!(),
+                            (r, chunk)
+                        }))
                 }
-            }
 
-            Channel::Input | Channel::LineInput => {
-                let val = r
-                    .read_u32::<BigEndian>()
-                    .map_err(ReadChunkError::ReadData)?;
+                Channel::Input | Channel::LineInput => {
+                    future::Either::B(
+                        read_exact(r, [0u8; 4])
+                            .map_err(ReadChunkError::ReadData)
+                            .map(|(r, bytes)| {
+                                let val = BigEndian::read_u32(&bytes);
+                                let chunk = match channel {
+                                    Channel::Input => Chunk::Input(val),
+                                    Channel::LineInput => Chunk::LineInput(val),
+                                    _ => unreachable!(),
+                                }
 
-                match channel {
-                    Channel::Input => Chunk::Input(val),
-                    Channel::LineInput => Chunk::LineInput(val),
-                    _ => unreachable!(),
+                                (r, val)
+                        })
+                    )
                 }
-            }
-        })
+            })
     }
 
     fn parse_hello(chunk: Chunk) -> Result<(String, HashSet<Capability>), HelloError> {
